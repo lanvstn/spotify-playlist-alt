@@ -73,11 +73,6 @@ func main() {
 	log.Println("yay")
 }
 
-type plan struct {
-	From  int
-	Moved int
-}
-
 type savedPlaylist struct {
 	Playlist spotify.SimplePlaylist
 	Items    []spotify.PlaylistItem
@@ -89,21 +84,27 @@ func run(ctx context.Context, c *spotify.Client) error {
 		return fmt.Errorf("error in playlist load: %w", err)
 	}
 
-	ps := makePlans(sp)
+	actions := makeActions(sp)
+	if len(actions) == 0 {
+		log.Println("nothing to do")
+		return nil
+	}
 
 	if *dry {
+		dryRun(actions, sp)
 		log.Println("exit early dry run")
 		return nil
 	}
 
 	ss := sp.Playlist.SnapshotID
-	for psi, p := range ps {
-		log.Printf("Reorder: %d/%d", psi+1, len(ps))
+	for psi, p := range actions {
+		log.Printf("Reorder: %d/%d", psi+1, len(actions))
+		// https://developer.spotify.com/documentation/web-api/reference/reorder-or-replace-playlists-tracks
 		ss, err = c.ReorderPlaylistTracks(ctx, sp.Playlist.ID, spotify.PlaylistReorderOptions{
 			SnapshotID:   ss,
-			RangeStart:   spotify.Numeric(p.From),
+			RangeStart:   spotify.Numeric(p.from),
 			RangeLength:  1,
-			InsertBefore: spotify.Numeric(len(sp.Items)), // Move to back
+			InsertBefore: spotify.Numeric(p.to),
 		})
 		if err != nil {
 			// todo make stored playlist invalid now
@@ -114,7 +115,21 @@ func run(ctx context.Context, c *spotify.Client) error {
 	return nil
 }
 
-func makePlans(sp *savedPlaylist) []*plan {
+func dryRun(actions []sortAction, sp *savedPlaylist) {
+	report := "DRY RUN\n"
+
+	report += fmt.Sprintf("%d actions\n", len(actions))
+	sp.Items = applyPlan(actions, sp.Items)
+
+	report += "\nNEW PLAYLIST\n"
+	for i, item := range sp.Items {
+		report += fmt.Sprintf("%4d | %s : %s\n", i, item.AddedBy.ID, item.Track.Track.Name)
+	}
+
+	fmt.Println(report)
+}
+
+func makeActions(sp *savedPlaylist) []sortAction {
 	type itemWithIndex struct {
 		Item  spotify.PlaylistItem
 		Index int
@@ -131,39 +146,21 @@ func makePlans(sp *savedPlaylist) []*plan {
 		return ii.Item.AddedBy.ID
 	})...)
 
-	plans := lo.Map(il, func(ii itemWithIndex, newIdx int) *plan {
-		return &plan{
-			From:  ii.Index,
-			Moved: -1,
+	actions := lo.Map(il, func(ii itemWithIndex, newIdx int) sortAction {
+		return sortAction{
+			from: ii.Index,
+			to:   newIdx,
 		}
 	})
 
-	simulateMoves(plans)
+	actions = planSort(actions)
 
-	return plans
-}
+	actions = lo.Filter(actions, func(a sortAction, _ int) bool {
+		// Both of these cases would be a noop.
+		return a.from != a.to-1 && a.from != a.to
+	})
 
-// Since spotify does not to bulk re order I need to simulate moving stuff around
-// because the From index used in the API call keeps changing when other stuff is moved.
-
-// This function simulates this move and makes sure the From index when the API call is made
-// takes into account all the moves that came before it.
-func simulateMoves(ps []*plan) {
-	for i1, p1 := range ps {
-		// move all other items that are below this one up now that we have moved this one to the back
-		for i2, p2 := range ps {
-			if i1 == i2 {
-				continue
-			}
-			if p2.Moved != -1 {
-				continue // no need to move up, it has been moved
-			}
-			if p2.From > p1.From { // p2.From can never be 0 because it is bigger than p1.From
-				p2.From--
-			}
-		}
-		p1.Moved = len(ps)
-	}
+	return actions
 }
 
 func loadPlaylistLocal(name string) (*savedPlaylist, bool) {
@@ -183,8 +180,16 @@ func loadPlaylistLocal(name string) (*savedPlaylist, bool) {
 func loadPlaylist(ctx context.Context, c *spotify.Client, name string) (*savedPlaylist, error) {
 	sp, ok := loadPlaylistLocal(name)
 	if ok {
-		log.Println("Loaded playlist locally")
-		return sp, nil
+		ss, err := c.GetPlaylist(ctx, sp.Playlist.ID, spotify.Fields("snapshot_id"))
+		if err != nil {
+			return nil, fmt.Errorf("failed to check if cached playlist is up to date: %w", err)
+		}
+		if ss.SnapshotID == sp.Playlist.SnapshotID {
+			log.Println("Cached playlist up to date")
+			return sp, nil
+		} else {
+			log.Println("Snapshot mismatch on locally downloaded playlist, redownloading")
+		}
 	}
 
 	log.Println("Searching playlist")
